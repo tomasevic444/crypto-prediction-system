@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
+env/
 build/
 develop-eggs/
 dist/
@@ -35,4 +36,6 @@ ENV/
 *.log
 
 # Environment variables
-.env
+.env*.h5
+*.model
+*.pkl
