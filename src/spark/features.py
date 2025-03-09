@@ -1,5 +1,5 @@
 from pyspark.sql import SparkSession, Window
-from pyspark.sql.functions import col, avg, stddev, lag, when, sum, lit, row_number, expr
+from pyspark.sql.functions import col, avg, stddev, lag, lead, when, sum, lit, row_number, expr
 import pyspark.sql.functions as F
 
 def calculate_sma(df, column, window_size):
@@ -185,9 +185,116 @@ def calculate_macd(df, column, fast_period=12, slow_period=26, signal_period=9):
     
     return result_df
 
+def calculate_volatility(df, column, window_size=5):
+    """
+    Calculate price volatility as standard deviation over specified period
+    
+    Args:
+        df: DataFrame with time series data
+        column: Column to calculate volatility for
+        window_size: Window size (default: 5)
+        
+    Returns:
+        DataFrame with volatility column added
+    """
+    window_spec = Window.partitionBy("symbol").orderBy("timestamp").rowsBetween(-(window_size-1), 0)
+    
+    # Calculate standard deviation of prices
+    result_df = df.withColumn(
+        f"volatility_{window_size}",
+        stddev(col(column)).over(window_spec)
+    )
+    
+    # Also calculate as percentage of price
+    result_df = result_df.withColumn(
+        f"volatility_pct_{window_size}",
+        (col(f"volatility_{window_size}") / col(column)) * 100
+    )
+    
+    return result_df
+
+def calculate_price_momentum(df, column, periods=[1, 3, 6]):
+    """
+    Calculate price momentum (percentage change) over various periods
+    
+    Args:
+        df: DataFrame with time series data
+        column: Column to calculate momentum for
+        periods: List of periods to calculate momentum for
+        
+    Returns:
+        DataFrame with momentum columns added
+    """
+    window_spec = Window.partitionBy("symbol").orderBy("timestamp")
+    result_df = df
+    
+    for period in periods:
+        result_df = result_df.withColumn(
+            f"momentum_{period}",
+            (col(column) / lag(col(column), period).over(window_spec) - 1) * 100
+        )
+    
+    return result_df
+
+def add_prediction_targets(df, price_column="price", horizon=1):
+    """
+    Add future price as prediction target (for 4-hour forecasting)
+    
+    Args:
+        df: DataFrame with time series data
+        price_column: Column name for price data
+        horizon: Number of periods to look ahead
+        
+    Returns:
+        DataFrame with prediction targets
+    """
+    window_spec = Window.partitionBy("symbol").orderBy("timestamp")
+    
+    # Add future price as target
+    result_df = df.withColumn(
+        f"target_price_{horizon}",
+        lead(col(price_column), horizon).over(window_spec)
+    )
+    
+    # Add price change percentage as alternative target
+    result_df = result_df.withColumn(
+        f"target_pct_change_{horizon}",
+        when(col(f"target_price_{horizon}").isNotNull(),
+             (col(f"target_price_{horizon}") - col(price_column)) / col(price_column) * 100
+        ).otherwise(None)
+    )
+    
+    # Add target direction (up/down) - useful for classification
+    result_df = result_df.withColumn(
+        f"target_direction_{horizon}",
+        when(col(f"target_pct_change_{horizon}") > 0, 1).otherwise(0)
+    )
+    
+    return result_df
+
+def create_time_features(df, timestamp_column="timestamp"):
+    """
+    Create time-based features from timestamp
+    
+    Args:
+        df: DataFrame with time series data
+        timestamp_column: Column name with timestamp data
+        
+    Returns:
+        DataFrame with time features added
+    """
+    result_df = df \
+        .withColumn("hour_of_day", F.hour(col(timestamp_column))) \
+        .withColumn("day_of_week", F.dayofweek(col(timestamp_column))) \
+        .withColumn("day_of_month", F.dayofmonth(col(timestamp_column))) \
+        .withColumn("month", F.month(col(timestamp_column))) \
+        .withColumn("is_weekend", when(F.dayofweek(col(timestamp_column)).isin([1, 7]), 1).otherwise(0))
+    
+    return result_df
+
 def add_all_features(df, price_column="price"):
     """
-    Add all technical indicators as features
+    Add all technical indicators as features - optimized for 4-hour predictions
     
     Args:
         df: DataFrame with time series data
@@ -198,21 +305,33 @@ def add_all_features(df, price_column="price"):
     """
     result_df = df
     
-    # Add SMAs with different periods
-    for period in [5, 10, 20, 50]:
+    # Add time-based features
+    result_df = create_time_features(result_df)
+    
+    # Add SMAs with different periods - adjusted for 4-hour timeframe
+    for period in [3, 6, 12, 24, 72]:  # 12h, 24h, 48h, 4 days, 12 days
         result_df = calculate_sma(result_df, price_column, period)
     
     # Add EMAs with different periods
-    for period in [5, 10, 20, 50]:
+    for period in [3, 6, 12, 24, 72]:
         result_df = calculate_ema(result_df, price_column, period)
     
     # Add Bollinger Bands
-    result_df = calculate_bollinger_bands(result_df, price_column, 20, 2)
+    result_df = calculate_bollinger_bands(result_df, price_column, 24, 2)  # 4 days
     
     # Add RSI
-    result_df = calculate_rsi(result_df, price_column, 14)
+    result_df = calculate_rsi(result_df, price_column, 14)  # 56 hours
     
-    # Add MACD
-    result_df = calculate_macd(result_df, price_column)
+    # Add MACD - optimized for 4-hour candles
+    result_df = calculate_macd(result_df, price_column, 3, 9, 4)  # 12h, 36h, 16h
+    
+    # Add volatility
+    result_df = calculate_volatility(result_df, price_column, 6)  # 24 hours
+    
+    # Add price momentum
+    result_df = calculate_price_momentum(result_df, price_column, [1, 3, 6, 12])
+    
+    # Add prediction targets
+    result_df = add_prediction_targets(result_df, price_column, 1)  # 1 period ahead (4 hours)
     
     return result_df
